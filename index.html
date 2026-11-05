@@ -1,0 +1,1054 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Pink Ring</title>
+<meta name="description" content="Clear pool water with a pink life ring that tips, sinks, bounces and drifts under real floating physics when the cursor touches it.">
+<style>
+  /* Layout: the pool fills the window, edge to edge. A deliberate single look. */
+  :root {
+    --pool: #8fcdf2;
+    --ink: #ffffff;
+    --ink-shadow: rgba(4, 58, 92, .7);
+    --sans: "Figtree", ui-rounded, system-ui, sans-serif;
+    color-scheme: light;
+  }
+  html, body { height: 100%; overflow: hidden; margin: 0; padding: 0; }
+  body { background: var(--pool); font-family: var(--sans); }
+  #square { position: fixed; inset: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
+  #hint {
+    position: absolute; left: 0; right: 0; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); margin: 0;
+    padding-inline: 16px; text-align: center; pointer-events: none;
+    color: var(--ink); font-size: .9375rem; font-weight: 500;
+    text-shadow: 0 1px 8px var(--ink-shadow), 0 0 2px var(--ink-shadow);
+    transition: opacity 1.4s ease;
+  }
+  #hint.gone { opacity: 0; }
+  @media (prefers-reduced-motion: reduce) { #hint { transition: none; } }
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@500&display=swap">
+</head>
+<body>
+
+<div id="square">
+  <canvas id="pool" aria-label="Clear swimming pool water with a pink life ring floating on it. Moving the cursor makes ripples. Touching the ring tips it and presses it into the water, and it bounces back."></canvas>
+  <p id="hint">Move across the water, then push the ring</p>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('pool');
+  const hint = document.getElementById('hint');
+  const gl = canvas.getContext('webgl2', { alpha: false, antialias: true, depth: true, powerPreference: 'high-performance' });
+  const hdr = gl && (gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'));
+  if (!gl || !hdr) {
+    hint.textContent = 'This pool needs WebGL 2. Turn on hardware acceleration in your browser to see it.';
+    return;
+  }
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---------- world ---------- */
+
+  const TAU = Math.PI * 2;
+  const DOMAIN = 2.3;      // half-width of the simulated water
+  const FLOOR = 2.4;       // half-width of the pool floor textures
+  const DEPTH = 1.25;       // water depth
+  const R = .18, r = .068;  // ring radius and tube radius
+
+  const PITCH = 80 * Math.PI / 180, CAM_DIST = 4.4;
+  const FWD = [0, -Math.sin(PITCH), Math.cos(PITCH)];
+  const UP = [0, Math.cos(PITCH), Math.sin(PITCH)];
+  const RIGHT = [1, 0, 0];
+  const CAM = [-FWD[0] * CAM_DIST, -FWD[1] * CAM_DIST, -FWD[2] * CAM_DIST];
+
+  // The window's long side always spans the same stretch of water, so the ring keeps its size relative to it.
+  const LONG_SIDE = 1.35;
+  let focalX = 1, focalY = 1, viewX = 1, viewZ = 1;
+  function fitView() {
+    const a = Math.max(1, innerWidth) / Math.max(1, innerHeight), f = CAM_DIST / LONG_SIDE;
+    focalX = a >= 1 ? f : f / a;
+    focalY = a >= 1 ? f * a : f;
+    viewX = CAM_DIST / focalX;
+    viewZ = CAM_DIST / focalY;
+  }
+  fitView();
+
+  function planeHit(nx, ny) {
+    const sx = nx / focalX, sy = ny / focalY;
+    const d = [FWD[0] + RIGHT[0] * sx + UP[0] * sy, FWD[1] + RIGHT[1] * sx + UP[1] * sy, FWD[2] + RIGHT[2] * sx + UP[2] * sy];
+    const t = -CAM[1] / d[1];
+    return [CAM[0] + d[0] * t, CAM[2] + d[2] * t];
+  }
+
+  /* ---------- water: a wave equation on the CPU, so the ring can feel it directly ---------- */
+
+  const N = 550, CELL = 2 * DOMAIN / (N - 1);
+  const STEP = 1 / 120;
+  let H = new Float32Array(N * N), Hn = new Float32Array(N * N);
+  const V = new Float32Array(N * N);
+  const PRESSED = new Float32Array(N * N); // how far the ring pushed into each cell last step
+  const RIM = new Float32Array(N * N);
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const e = Math.min(i, j, N - 1 - i, N - 1 - j) / (N * .06);
+    RIM[i + j * N] = e >= 1 ? 1 : .86 + .14 * e * e;
+  }
+
+  function stepWater() {
+    for (let j = 1; j < N - 1; j++) {
+      let k = 1 + j * N;
+      for (let i = 1; i < N - 1; i++, k++) {
+        const h = H[k];
+        const avg = .25 * (H[k - 1] + H[k + 1] + H[k - N] + H[k + N]);
+        let v = (V[k] + (avg - h) * 1.25) * .9962 * RIM[k];
+        V[k] = v;
+        Hn[k] = (h + v + (avg - h) * .010) * .9994;
+      }
+    }
+    const t = H; H = Hn; Hn = t;
+  }
+
+  let sampleV = 0;
+  function sampleWater(x, z) {
+    const fx = Math.min(Math.max((x + DOMAIN) / CELL, 0), N - 1.001);
+    const fz = Math.min(Math.max((z + DOMAIN) / CELL, 0), N - 1.001);
+    const i = fx | 0, j = fz | 0, u = fx - i, w = fz - j, k = i + j * N;
+    const u1 = 1 - u, w1 = 1 - w;
+    sampleV = (V[k] * u1 + V[k + 1] * u) * w1 + (V[k + N] * u1 + V[k + N + 1] * u) * w;
+    return (H[k] * u1 + H[k + 1] * u) * w1 + (H[k + N] * u1 + H[k + N + 1] * u) * w;
+  }
+
+  // Two matched gaussians add no net volume, so the surface never drifts.
+  function touchWater(x, z, amount) {
+    const rad = .045, reach = Math.ceil(rad * 3.4 / CELL);
+    const cx = Math.round((x + DOMAIN) / CELL), cz = Math.round((z + DOMAIN) / CELL);
+    for (let j = Math.max(1, cz - reach); j <= Math.min(N - 2, cz + reach); j++) {
+      for (let i = Math.max(1, cx - reach); i <= Math.min(N - 2, cx + reach); i++) {
+        const dx = -DOMAIN + i * CELL - x, dz = -DOMAIN + j * CELL - z;
+        const d2 = (dx * dx + dz * dz) / (rad * rad);
+        H[i + j * N] -= amount * (Math.exp(-d2) - .5 * Math.exp(-d2 * .5));
+      }
+    }
+  }
+
+  // A coarse copy of the water that only the cursor writes to. The ring's sideways push reads this,
+  // so its own wake can't shove it along.
+  const M = 137, FCELL = 2 * DOMAIN / (M - 1);
+  let FH = new Float32Array(M * M), FHn = new Float32Array(M * M);
+  const FV = new Float32Array(M * M);
+
+  function stepFar() {
+    for (let j = 1; j < M - 1; j++) {
+      let k = 1 + j * M;
+      for (let i = 1; i < M - 1; i++, k++) {
+        const h = FH[k];
+        const avg = .25 * (FH[k - 1] + FH[k + 1] + FH[k - M] + FH[k + M]);
+        const edge = Math.min(i, j, M - 1 - i, M - 1 - j) < 6 ? .97 : 1;
+        const v = (FV[k] + (avg - h) * .075) * .9962 * edge;
+        FV[k] = v;
+        FHn[k] = (h + v) * .9994;
+      }
+    }
+    const t = FH; FH = FHn; FHn = t;
+  }
+
+  let farV = 0;
+  function sampleFar(x, z) {
+    const fx = Math.min(Math.max((x + DOMAIN) / FCELL, 0), M - 1.001);
+    const fz = Math.min(Math.max((z + DOMAIN) / FCELL, 0), M - 1.001);
+    const i = fx | 0, j = fz | 0, u = fx - i, w = fz - j, k = i + j * M;
+    const u1 = 1 - u, w1 = 1 - w;
+    farV = (FV[k] * u1 + FV[k + 1] * u) * w1 + (FV[k + M] * u1 + FV[k + M + 1] * u) * w;
+    return (FH[k] * u1 + FH[k + 1] * u) * w1 + (FH[k + M] * u1 + FH[k + M + 1] * u) * w;
+  }
+
+  function touchFar(x, z, amount) {
+    const rad = .085, reach = Math.ceil(rad * 3 / FCELL);
+    const cx = Math.round((x + DOMAIN) / FCELL), cz = Math.round((z + DOMAIN) / FCELL);
+    for (let j = Math.max(1, cz - reach); j <= Math.min(M - 2, cz + reach); j++) {
+      for (let i = Math.max(1, cx - reach); i <= Math.min(M - 2, cx + reach); i++) {
+        const dx = -DOMAIN + i * FCELL - x, dz = -DOMAIN + j * FCELL - z;
+        const d2 = (dx * dx + dz * dz) / (rad * rad);
+        FH[i + j * M] -= amount * (Math.exp(-d2) - .5 * Math.exp(-d2 * .5));
+      }
+    }
+  }
+
+  // Long slow swell, matching the broad shapes the shader adds. The ring rides it at rest.
+  const swell = (x, z, t) =>
+    .0030 * Math.sin(x * 4.1 + z * 2.3 + t * 1.15) +
+    .0021 * Math.sin(-x * 3.0 + z * 5.1 + t * 1.45);
+
+  /* ---------- the ring: buoyancy measured around the tube ---------- */
+
+  const G = 7;
+  const SITS = r * .85;          // how deep the tube sits at rest
+  const circleSegment = s => {   // cross-section of the tube under water
+    const c = Math.min(Math.max(1 - s / r, -1), 1);
+    return r * r * Math.acos(c) - (r - s) * Math.sqrt(Math.max(2 * r * s - s * s, 0));
+  };
+  const REST = circleSegment(SITS);
+  const REST_Y = r - SITS;
+  const INERTIA = .9 * R * R;
+  const K = 24;
+  const ring = {
+    x: -viewX * .38, z: viewZ * .24, y: REST_Y, vx: 0, vz: 0, vy: 0,
+    gx: 0, gz: 0, wx: 0, wz: 0,  // tilt as a slope across the ring, and how fast it changes
+    yaw: .35, spin: 0,
+    press: 0,                    // how hard the cursor is pushing, 0 to 1
+    pressX: 0, pressZ: 0, pushX: 0, pushZ: 0,
+  };
+  // Arrives with a small drop so the first moments already show the bounce.
+  if (!reducedMotion) { ring.y += .085; ring.gx = .07; ring.gz = -.05; }
+
+  const ringH = new Float32Array(K), ringV = new Float32Array(K);
+  let simTime = 0;
+
+  function stepRing(dt) {
+    let ay = -G, tx = 0, tz = 0, hx = 0, hz = 0, ex = 0, ez = 0;
+    for (let i = 0; i < K; i++) {
+      const a = i / K * TAU, ca = Math.cos(a), sa = Math.sin(a);
+      const x = R * ca, z = R * sa, wx = ring.x + x, wz = ring.z + z;
+
+      // Read the water just beyond the tube on both sides, so the ring doesn't feel its own dent.
+      const out = R + r + .03, inn = R - r - .03;
+      const h1 = sampleWater(ring.x + out * ca, ring.z + out * sa), v1 = sampleV;
+      const h2 = sampleWater(ring.x + inn * ca, ring.z + inn * sa), v2 = sampleV;
+      const wave = (h1 + h2) / 2, wv = (v1 + v2) / 2 / STEP;
+      const h = wave + swell(wx, wz, simTime);
+
+      const yi = ring.y + ring.gx * x + ring.gz * z;
+      const s = Math.min(Math.max(h - (yi - r), 0), 2 * r);
+      const rel = ring.vy + ring.wx * x + ring.wz * z - wv;
+      const f = (G * circleSegment(s) / REST - 8 * (s / (2 * r)) * rel) / K;
+      ay += f; tx += f * x; tz += f * z;
+
+      const fo = sampleFar(ring.x + out * ca, ring.z + out * sa), fvo = farV;
+      const fi = sampleFar(ring.x + inn * ca, ring.z + inn * sa), fvi = farV;
+      const fw = (fo + fi) / 2, fv = (fvo + fvi) / 2 / STEP;
+      ringH[i] = fw; ringV[i] = fv;
+      hx += fw * ca; hz += fw * sa;
+      const e = fw * fw + (fv / 11) * (fv / 11);
+      ex += e * ca; ez += e * sa;
+    }
+    let ax = 0, az = 0;
+
+    // The tube slides down the slope of a passing wave...
+    const scale = 2 / (K * R);
+    ax -= G * hx * scale * .035;
+    az -= G * hz * scale * .035;
+    // ...and the energy in a ripple leans on the side that it reaches first.
+    let px = -130000 * ex / K, pz = -130000 * ez / K;
+    const lean = Math.hypot(px, pz);
+    if (lean > .8) { px *= .8 / lean; pz *= .8 / lean; }
+    ax += px; az += pz;
+
+    // Waves passing at an angle turn the ring.
+    let turn = 0;
+    for (let i = 0; i < K; i++) turn += (ringH[(i + 1) % K] - ringH[(i + K - 1) % K]) * ringV[i];
+    turn = Math.min(Math.max(turn * 3000 / K, -.8), .8);
+
+    let ax2 = tx / INERTIA, az2 = tz / INERTIA;
+    if (ring.press > .001) {
+      const A = 3.0 * ring.press;
+      ay -= A;
+      ax2 -= A * ring.pressX / INERTIA;
+      az2 -= A * ring.pressZ / INERTIA;
+      ax += ring.pushX * ring.press * 2.6;
+      az += ring.pushZ * ring.press * 2.6;
+      turn += (ring.pressX * ring.pushZ - ring.pressZ * ring.pushX) * ring.press * 7;
+    }
+
+    // Free to float anywhere in view. Only the window's edges turn it back, softly.
+    const limX = Math.max(viewX - (R + r + .09), 0), limZ = Math.max(viewZ - (R + r + .09), 0);
+    if (Math.abs(ring.x) > limX) ax -= Math.sign(ring.x) * (Math.abs(ring.x) - limX) * 5;
+    if (Math.abs(ring.z) > limZ) az -= Math.sign(ring.z) * (Math.abs(ring.z) - limZ) * 5;
+
+    ring.vx += (ax - ring.vx * .42) * dt;
+    ring.vz += (az - ring.vz * .42) * dt;
+    ring.spin += (turn - ring.spin * .5) * dt;
+    ring.vy += ay * dt;
+    ring.wx += ax2 * dt;
+    ring.wz += az2 * dt;
+    ring.x += ring.vx * dt;
+    ring.z += ring.vz * dt;
+    ring.yaw += ring.spin * dt;
+    ring.y += ring.vy * dt;
+    ring.gx += ring.wx * dt;
+    ring.gz += ring.wz * dt;
+
+    const tilt = Math.hypot(ring.gx, ring.gz);
+    if (tilt > .75) { ring.gx *= .75 / tilt; ring.gz *= .75 / tilt; }
+  }
+
+  // Whatever the tube pushes into the water or lifts out of it becomes waves.
+  function ringIntoWater() {
+    const reach = R + r + CELL * 8;
+    const i0 = Math.max(1, Math.floor((ring.x - reach + DOMAIN) / CELL)), i1 = Math.min(N - 2, Math.ceil((ring.x + reach + DOMAIN) / CELL));
+    const j0 = Math.max(1, Math.floor((ring.z - reach + DOMAIN) / CELL)), j1 = Math.min(N - 2, Math.ceil((ring.z + reach + DOMAIN) / CELL));
+    for (let j = j0; j <= j1; j++) {
+      const dz = -DOMAIN + j * CELL - ring.z;
+      for (let i = i0; i <= i1; i++) {
+        const k = i + j * N, dx = -DOMAIN + i * CELL - ring.x;
+        const q = Math.hypot(dx, dz) - R;
+        let d = 0;
+        if (Math.abs(q) < r) {
+          const half = Math.sqrt(r * r - q * q);
+          d = Math.max(0, half - (ring.y + ring.gx * dx + ring.gz * dz));
+          V[k] *= .93;
+        }
+        const src = d - PRESSED[k];
+        if (src !== 0) {
+          H[k] -= Math.min(Math.max(src, -.02), .02) * .2;
+          PRESSED[k] = d;
+        }
+      }
+    }
+  }
+
+  /* ---------- cursor ---------- */
+
+  let pointer = null, lastPointer = null, down = false, dwell = 0;
+
+  function moveTo(cx, cy) {
+    const b = canvas.getBoundingClientRect();
+    pointer = planeHit((cx - b.left) / b.width * 2 - 1, 1 - (cy - b.top) / b.height * 2);
+    hint.classList.add('gone');
+  }
+  canvas.addEventListener('pointermove', e => moveTo(e.clientX, e.clientY), { passive: true });
+  canvas.addEventListener('pointerdown', e => { down = true; moveTo(e.clientX, e.clientY); canvas.setPointerCapture?.(e.pointerId); }, { passive: true });
+  addEventListener('pointerup', () => { down = false; }, { passive: true });
+  canvas.addEventListener('pointerleave', () => { pointer = lastPointer = null; });
+
+  function applyCursor(dt) {
+    let target = 0;
+    if (pointer) {
+      const last = lastPointer || pointer;
+      const dx = pointer[0] - last[0], dz = pointer[1] - last[1];
+      const len = Math.hypot(dx, dz);
+      const speed = len / dt;
+
+      const relX = pointer[0] - ring.x, relZ = pointer[1] - ring.z;
+      const rho = Math.hypot(relX, relZ) || 1e-5;
+      const touching = Math.abs(rho - R) < r + .02;
+
+      if (touching) {
+        // Contact point on the tube's centerline.
+        ring.pressX = relX / rho * R; ring.pressZ = relZ / rho * R;
+        const v = Math.min(speed, 2.2);
+        ring.pushX = len > 1e-5 ? dx / len * v * .32 : 0;
+        ring.pushZ = len > 1e-5 ? dz / len * v * .32 : 0;
+        if (speed > .04) dwell = .16;
+        if (dwell > 0 || down) target = Math.min(1, .55 + speed * .4);
+        if (down) target = 1;
+      } else if (lastPointer && len > 1e-4 && len < .9) {
+        // Open water: the cursor draws a soft wake.
+        const steps = Math.min(8, Math.ceil(len / .028));
+        const amount = .0033 * Math.min(len / steps / .028, 1.2);
+        for (let i = 1; i <= steps; i++) {
+          touchWater(last[0] + dx * i / steps, last[1] + dz * i / steps, amount);
+          touchFar(last[0] + dx * i / steps, last[1] + dz * i / steps, amount * 3);
+        }
+      }
+      lastPointer = pointer;
+    }
+    dwell = Math.max(0, dwell - dt);
+    // A quick press and a slower release, so the ring is free to bounce even if the cursor stays put.
+    ring.press += (target - ring.press) * Math.min(1, dt * (target > ring.press ? 22 : 7));
+  }
+
+  /* ---------- shaders ---------- */
+
+  const FULL_VERT = `#version 300 es
+  out vec2 vUv;
+  void main(){
+    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    vUv = p;
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+  }`;
+
+  const WORLD = `
+  const float DOMAIN = ${DOMAIN.toFixed(3)}, FLOOR = ${FLOOR.toFixed(3)}, DEPTH = ${DEPTH.toFixed(3)};
+  const float RR = ${R.toFixed(3)}, TUBE = ${r.toFixed(3)};
+  const vec3 SUN = normalize(vec3(-.40, .92, .34));
+  const vec3 SUNCOL = vec3(1.20, 1.12, 1.00);
+  vec2 surfUv(vec2 w){ return w / DOMAIN * .5 + .5; }
+  vec2 floorUv(vec2 w){ return w / FLOOR * .5 + .5; }
+  vec3 skyColor(vec3 d){
+    float up = clamp(d.y, 0., 1.);
+    vec3 s = mix(vec3(.95, .97, 1.02), vec3(.26, .54, 1.02), pow(up, .55));
+    float wisp = smoothstep(.45, .85, .5 + .5 * sin(d.x * 7. + d.z * 3.) * sin(d.z * 8. - d.x * 2.));
+    return mix(s, vec3(1.1), wisp * .34 * (1. - up * .55));
+  }
+  float bandMask(float ang, float aa){
+    float f = abs(fract(ang * 4. / 6.28318 + .5) - .5) * 6.28318 / 4.;
+    return smoothstep(.135 + aa, .135 - aa, f);
+  }`;
+
+  const CAMERA = `
+  uniform vec3 uCam, uR, uU, uF;
+  uniform vec2 uFocal;
+  vec4 project(vec3 p){
+    vec3 q = p - uCam;
+    float x = dot(q, uR), y = dot(q, uU), z = dot(q, uF);
+    const float n = .2, f = 20.;
+    return vec4(x * uFocal.x, y * uFocal.y, z * (f + n) / (f - n) - 2. * f * n / (f - n), z);
+  }`;
+
+  const NOISE = `
+  float h21(vec2 p){ vec3 q = fract(p.xyx * .1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }
+  float vn(vec2 p){
+    vec2 i = floor(p), f = fract(p); f = f*f*(3.-2.*f);
+    return mix(mix(h21(i), h21(i+vec2(1,0)), f.x), mix(h21(i+vec2(0,1)), h21(i+vec2(1,1)), f.x), f.y);
+  }`;
+
+  const GRADE = `
+  vec3 grade(vec3 c){
+    c = max(c, 0.);
+    c = mix(c, .78 + .22 * (1. - exp(-(c - .78) / .22)), step(.78, c));
+    c += (fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(.06711056, .00583715)))) - .5) / 255.;
+    return c;
+  }`;
+
+  // Glazed pool mosaic, painted once.
+  const TILES = `#version 300 es
+  precision highp float;
+  in vec2 vUv; out vec4 o;
+  ${WORLD}
+  ${NOISE}
+  void main(){
+    vec2 w = (vUv * 2. - 1.) * FLOOR;
+    float a = .10; mat2 rot = mat2(cos(a), -sin(a), sin(a), cos(a));
+    vec2 q = rot * w / .172 + vec2(.5, .27);
+    vec2 id = floor(q), f = fract(q) - .5;
+    vec2 e = .5 - abs(f);
+    float edge = min(e.x, e.y);
+    float grout = smoothstep(.016, .034, edge);
+
+    vec3 glaze = vec3(.50, .78, .96);
+    glaze *= .985 + .03 * h21(id);
+
+    // Each tile's pillowed edge catches the sun differently.
+    float bevel = smoothstep(.10, .03, edge);
+    vec2 dir = e.x < e.y ? vec2(sign(f.x), 0.) : vec2(0., sign(f.y));
+    float lit = dot(dir, normalize(vec2(-.5, .4))) * bevel * .06;
+    vec3 col = glaze * (1. + lit);
+    col = mix(vec3(.62, .85, .98), col, grout);
+    o = vec4(col, 1.);
+  }`;
+
+  // Combines the simulated waves with fine wind texture. r: height, g, b: slope.
+  const SURFACE = `#version 300 es
+  precision highp float;
+  in vec2 vUv; out vec4 o;
+  uniform sampler2D uSim;
+  uniform vec2 uTexel;
+  uniform float uT;
+  ${WORLD}
+  vec2 hash(vec2 p){
+    vec3 q = fract(p.xyx * vec3(.1031, .1030, .0973));
+    q += dot(q, q.yzx + 33.33);
+    return -1. + 2. * fract((q.xx + q.yz) * q.zy);
+  }
+  float gn(vec2 p){
+    vec2 i = floor(p), f = fract(p), u = f*f*(3.-2.*f);
+    return mix(mix(dot(hash(i), f), dot(hash(i+vec2(1,0)), f-vec2(1,0)), u.x),
+               mix(dot(hash(i+vec2(0,1)), f-vec2(0,1)), dot(hash(i+vec2(1,1)), f-vec2(1,1)), u.x), u.y);
+  }
+  float wind(vec2 p){
+    float t = uT;
+    vec2 warp = vec2(gn(p * 1.4 + t * .09), gn(p * 1.4 + 11. - t * .07)) * .25;
+    p += warp;
+    return .0085 * gn(p * 2.6 + vec2(t*.20, t*.13))
+         + .0055 * gn(p * 5.0 + vec2(-t*.31, t*.26))
+         + .0005 * gn(p * 10.5 + vec2(t*.52, -t*.45));
+  }
+  float simH(vec2 uv){ return texture(uSim, uv).r; }
+  void main(){
+    vec2 w = (vUv * 2. - 1.) * DOMAIN;
+    const float E = .008;
+    float a0 = wind(w);
+    vec2 ga = vec2(wind(w + vec2(E,0)) - a0, wind(w + vec2(0,E)) - a0) / E;
+    vec2 t1 = uTexel * 1.25;
+    float dw = 2. * DOMAIN * uTexel.x * 1.25 * 2.;
+    float sl = simH(vUv - vec2(t1.x,0.)), sr = simH(vUv + vec2(t1.x,0.));
+    float sd = simH(vUv - vec2(0.,t1.y)), su = simH(vUv + vec2(0.,t1.y));
+    vec2 gs = vec2(sr - sl, su - sd) / dw;
+    float h = (sl + sr + sd + su) * .25 + a0;
+    o = vec4(h, ga.x + gs.x, ga.y + gs.y, 1.);
+  }`;
+
+  // Traces sunlight through the surface onto the floor. Where rays crowd together, light gathers.
+  const CAUSTIC_VERT = `#version 300 es
+  precision highp float;
+  layout(location=0) in vec2 aUv;
+  uniform sampler2D uSurf;
+  uniform float uIor;
+  ${WORLD}
+  out vec2 vOld, vNew;
+  void main(){
+    vec4 s = textureLod(uSurf, aUv, 0.);
+    vec2 w = (aUv * 2. - 1.) * DOMAIN;
+    vec3 n = normalize(vec3(-s.g, 1., -s.b));
+    vec3 ref = refract(-SUN, n, 1. / uIor);
+    vec3 flat_ = refract(-SUN, vec3(0,1,0), 1. / uIor);
+    vNew = w + ref.xz / -ref.y * (DEPTH + s.r);
+    vOld = w + flat_.xz / -flat_.y * DEPTH;
+    gl_Position = vec4(vNew / FLOOR, 0., 1.);
+  }`;
+  const CAUSTIC_FRAG = `#version 300 es
+  precision highp float;
+  in vec2 vOld, vNew;
+  out vec4 o;
+  void main(){
+    float oldA = length(dFdx(vOld)) * length(dFdy(vOld));
+    float newA = length(dFdx(vNew)) * length(dFdy(vNew));
+    float i = clamp(oldA / max(newA, 1e-7), 0., 14.);
+    o = vec4(i);
+  }`;
+
+  const WATER = `#version 300 es
+  precision highp float;
+  in vec2 vUv; out vec4 o;
+  uniform sampler2D uSurf, uFloor, uCaustic;
+  uniform float uT;
+  uniform vec3 uRingPos;
+  uniform mat3 uRingRot;
+  ${WORLD}
+  ${CAMERA}
+  ${GRADE}
+  float tube(vec3 l){ return length(vec2(length(l.xz) - RR, l.y)) - TUBE; }
+  void main(){
+    vec2 ndc = vUv * 2. - 1.;
+    vec3 ray = normalize(uF + uR * ndc.x / uFocal.x + uU * ndc.y / uFocal.y);
+    float dist = -uCam.y / ray.y;
+    vec3 P = uCam + ray * dist;
+    vec4 s = texture(uSurf, surfUv(P.xz));
+    P += ray * (s.r / -ray.y);
+    s = texture(uSurf, surfUv(P.xz));
+    vec3 N = normalize(vec3(-s.g, 1., -s.b));
+    vec3 V = -ray;
+
+    // Down through the water to the floor.
+    vec3 refr = refract(ray, N, 1. / 1.333);
+    float travel = (DEPTH + P.y) / -refr.y;
+    vec2 F = P.xz + refr.xz * travel;
+    vec3 tile = vec3(
+      texture(uFloor, floorUv(F + refr.xz * .004)).r,
+      texture(uFloor, floorUv(F)).g,
+      texture(uFloor, floorUv(F - refr.xz * .005)).b);
+
+    // Blur a touch so the traced mesh never shows.
+    vec2 cu = floorUv(F), pxl = vec2(1. / 2048.) * 1.5;
+    vec3 c = texture(uCaustic, cu).rgb * .4
+           + (texture(uCaustic, cu + pxl).rgb + texture(uCaustic, cu - pxl).rgb
+            + texture(uCaustic, cu + vec2(pxl.x, -pxl.y)).rgb + texture(uCaustic, cu - vec2(pxl.x, -pxl.y)).rgb) * .15;
+
+    // The ring's shadow on the floor, softened by the depth it falls through.
+    vec3 toSun = refract(-SUN, vec3(0,1,0), 1. / 1.333);
+    float tp = (DEPTH + uRingPos.y) / -toSun.y;
+    vec2 onRing = F - toSun.xz * tp - uRingPos.xz;
+    vec3 n = uRingRot[1];
+    vec3 lf = transpose(uRingRot) * vec3(onRing.x, -(n.x * onRing.x + n.z * onRing.y) / n.y, onRing.y);
+    float q = abs(length(lf.xz) - RR);
+    float ringShadow = smoothstep(TUBE + .085, TUBE - .055, q) * .86;
+    vec3 light = vec3(.44, .49, .51) + SUNCOL * c * .58 * (1. - ringShadow);
+    // A little sun passes through the pink plastic.
+    light += vec3(.17, .02, .07) * ringShadow * smoothstep(TUBE + .03, TUBE - .10, q);
+
+    vec3 col = tile * light;
+    // Where rays pile up, the light turns white.
+    col += SUNCOL * max(c - 2.4, vec3(0.)) * .08 * (1. - ringShadow);
+    col *= exp(-travel * vec3(.150, .030, .020));
+    col += vec3(.0, .022, .034) * travel;
+
+    // Surface: faint sky, a real reflection of the ring, and hard sun glints.
+    vec3 Rf = reflect(ray, N);
+    float cosV = clamp(dot(N, V), 0., 1.);
+    float fres = .02 + .98 * pow(1. - cosV, 5.);
+    vec3 refl = skyColor(Rf);
+    float hitAmt = 0.;
+    vec3 hitCol = vec3(0.);
+    vec3 lp = transpose(uRingRot) * (P - uRingPos), ld = transpose(uRingRot) * Rf;
+    float reachR = length(lp.xz);
+    if(reachR < RR + TUBE + .85){
+      float t = .004;
+      for(int i = 0; i < 12; i++){
+        float d = tube(lp + ld * t);
+        if(d < .002){ hitAmt = 1.; break; }
+        t += d;
+        if(t > 1.1) break;
+      }
+      if(hitAmt > .5){
+        vec3 h = lp + ld * t;
+        float band = bandMask(atan(h.z, h.x), .01);
+        hitCol = mix(vec3(.96, .26, .52), vec3(.96, .95, .92), band);
+        refl = hitCol * .95;
+      }
+    }
+    float mirror = clamp(fres + hitAmt * .24, 0., 1.);
+    col = mix(col, refl, mirror);
+
+    // Water darkens and then catches a thin bright line where it climbs the tube.
+    vec3 lw = transpose(uRingRot) * (P - uRingPos);
+    float contact = abs(length(lw.xz) - RR) - TUBE * .93;
+    if(contact > 0.){
+      col *= 1. - .34 * exp(-contact * 38.);
+      col += vec3(.20, .24, .26) * exp(-contact * 170.) * .55;
+    }
+
+    vec3 Hv = normalize(normalize(vec3(-.62, .70, .34)) + V);
+    float NH = max(dot(N, Hv), 0.);
+    col += SUNCOL * (pow(NH, 2800.) * 7.5 + pow(NH, 340.) * .012);
+
+    o = vec4(grade(col), 1.);
+  }`;
+
+  const RING_VERT = `#version 300 es
+  precision highp float;
+  layout(location=0) in vec3 aPos;
+  layout(location=1) in vec3 aNor;
+  layout(location=2) in vec3 aInfo; // angle around ring, along-rope position, 1 for rope
+  uniform sampler2D uSurf;
+  uniform vec3 uRingPos;
+  uniform mat3 uRingRot;
+  ${WORLD}
+  ${CAMERA}
+  out vec3 vW, vN, vLocal;
+  out vec3 vInfo;
+  out float vSub;
+  out vec3 vWaterN;
+  void main(){
+    vec3 w = uRingRot * aPos + uRingPos;
+    vec4 s = textureLod(uSurf, surfUv(w.xz), 0.);
+    float sub = s.r - w.y;
+    vSub = sub;
+    vWaterN = normalize(vec3(-s.g, 1., -s.b));
+    // Anything below the surface looks shallower and shifts with the water above it.
+    if(sub > 0.){
+      w.y = s.r - sub * .75;
+      w.xz += s.gb * sub * .28;
+    }
+    vW = w;
+    vN = uRingRot * aNor;
+    vLocal = aPos;
+    vInfo = aInfo;
+    gl_Position = project(w);
+  }`;
+
+  const RING_FRAG = `#version 300 es
+  precision highp float;
+  in vec3 vW, vN, vLocal, vInfo;
+  in float vSub;
+  in vec3 vWaterN;
+  out vec4 o;
+  uniform float uT;
+  ${WORLD}
+  ${CAMERA}
+  ${GRADE}
+  ${NOISE}
+  void main(){
+    vec3 N = normalize(vN);
+    vec3 V = normalize(uCam - vW);
+    float isRope = vInfo.z;
+    vec3 alb;
+    float gloss = 1.;
+    if(isRope > .5){
+      float strand = .5 + .5 * sin(vInfo.y * 150. + vInfo.x * 12.);
+      alb = vec3(.92, .91, .86) * (.88 + .12 * strand);
+      N = normalize(N + vec3(.12, 0., .12) * (strand - .5));
+      gloss = .12;
+    } else {
+      float ang = atan(vLocal.z, vLocal.x);
+      float aa = max(length(fwidth(vLocal.xz)) / RR * 1.3, .004);
+      float band = bandMask(ang, aa);
+      alb = mix(vec3(.94, .27, .49), vec3(.97, .95, .91), band);
+      // A pressed seam around the outside, and the raised lip at each band edge.
+      float seam = smoothstep(.0035, .0015, abs(vLocal.y));
+      alb *= 1. - seam * .22;
+      float f = abs(abs(fract(ang * 4. / 6.28318 + .5) - .5) * 6.28318 / 4. - .135);
+      alb *= 1. - smoothstep(.009 + aa, .002, f) * .16;
+      // Scuffed plastic and faint wear.
+      alb *= .975 + .05 * vn(vLocal.xz * 44.);
+    }
+
+    float nl = dot(N, SUN);
+    float wrap = clamp((nl + .22) / 1.22, 0., 1.);
+    // Light gathered inside the plastic keeps shadows rosy, and aqua bounces up from below.
+    vec3 sky = mix(vec3(.72, .82, 1.0), vec3(.44, .66, .78), clamp(-N.y * .5 + .5, 0., 1.));
+    vec3 bounce = vec3(.24, .50, .55) * clamp(-N.y * .7 + .3, 0., 1.);
+    vec3 col = alb * (SUNCOL * wrap * 1.0 + sky * .38 + bounce * .9);
+    col += alb * alb * vec3(.20, .05, .09) * (1. - wrap);
+
+    // Glossy skin: it mirrors the sky and throws a tight sun highlight.
+    float NV = clamp(dot(N, V), 0., 1.);
+    float fres = .045 + .955 * pow(1. - NV, 5.);
+    vec3 Rf = reflect(-V, N);
+    col = mix(col, skyColor(Rf), fres * gloss);
+    float NH = max(dot(N, normalize(SUN + V)), 0.);
+    col += SUNCOL * gloss * (pow(NH, 340.) * .75 + pow(NH, 60.) * .09);
+
+    // Wet near the waterline: darker and more mirrored.
+    float wet = smoothstep(.05, -.01, -vSub);
+    col = mix(col, col * .88, wet * .7);
+
+    // Below the surface: blue takes over with depth, and the surface sparkles on top.
+    float under = smoothstep(-.004, .004, vSub);
+    if(under > 0.){
+      vec3 uw = col * exp(-max(vSub, 0.) * vec3(1.15, .22, .14)) * vec3(.88, .97, 1.0);
+      uw += vec3(.0, .018, .03);
+      vec3 W = normalize(vWaterN);
+      float fw = .02 + .98 * pow(1. - clamp(dot(W, V), 0., 1.), 5.);
+      uw = mix(uw, skyColor(reflect(-V, W)), fw);
+      float WH = max(dot(W, normalize(normalize(vec3(-.62, .70, .34)) + V)), 0.);
+      uw += SUNCOL * pow(WH, 2800.) * 7.5;
+      col = mix(col, uw, under);
+    }
+    // The bright line where the water meets the tube.
+    col += vec3(.20, .24, .26) * exp(-abs(vSub) * 340.) * .32;
+
+    o = vec4(grade(col), 1.);
+  }`;
+
+  /* ---------- gl helpers ---------- */
+
+  function program(vs, fs) {
+    const make = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    const p = gl.createProgram();
+    gl.attachShader(p, make(gl.VERTEX_SHADER, vs));
+    gl.attachShader(p, make(gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+    const u = {};
+    const count = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < count; i++) {
+      const name = gl.getActiveUniform(p, i).name;
+      u[name] = gl.getUniformLocation(p, name);
+    }
+    return { p, u };
+  }
+
+  function texture(wrap, min, mag) {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, min);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, mag);
+    return t;
+  }
+
+  function bind(unit, tex, loc) {
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.uniform1i(loc, unit);
+  }
+
+  function target(w, h, internal, type, filter) {
+    const tex = texture(gl.CLAMP_TO_EDGE, filter, filter);
+    gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, gl.RGBA, type, null);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { tex, fbo, w, h };
+  }
+
+  function setCamera(prog) {
+    const u = prog.u;
+    gl.uniform3fv(u.uCam, CAM);
+    gl.uniform3fv(u.uR, RIGHT);
+    gl.uniform3fv(u.uU, UP);
+    gl.uniform3fv(u.uF, FWD);
+    gl.uniform2f(u.uFocal, focalX, focalY);
+  }
+
+  /* ---------- geometry ---------- */
+
+  function grid(n) {
+    const v = new Float32Array((n + 1) * (n + 1) * 2);
+    let o = 0;
+    for (let j = 0; j <= n; j++) for (let i = 0; i <= n; i++) { v[o++] = i / n; v[o++] = j / n; }
+    const idx = new Uint32Array(n * n * 6);
+    o = 0;
+    for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+      const a = i + j * (n + 1), b = a + 1, c = a + n + 1, d = c + 1;
+      idx[o++] = a; idx[o++] = c; idx[o++] = b; idx[o++] = b; idx[o++] = c; idx[o++] = d;
+    }
+    return { v, idx };
+  }
+
+  // The body of the ring, then a grab rope looped from band to band.
+  function ringMesh() {
+    const v = [], idx = [];
+    const SEG = 180, SIDE = 44;
+    for (let i = 0; i <= SEG; i++) {
+      const a = i / SEG * TAU, ca = Math.cos(a), sa = Math.sin(a);
+      for (let j = 0; j <= SIDE; j++) {
+        const b = j / SIDE * TAU, cb = Math.cos(b), sb = Math.sin(b);
+        const rad = R + r * cb;
+        v.push(rad * ca, r * sb, rad * sa, cb * ca, sb, cb * sa, a > Math.PI ? a - TAU : a, 0, 0);
+      }
+    }
+    for (let i = 0; i < SEG; i++) for (let j = 0; j < SIDE; j++) {
+      const a = i * (SIDE + 1) + j, b = a + 1, c = a + SIDE + 1, d = c + 1;
+      idx.push(a, c, b, b, c, d);
+    }
+    const tube = (fn, seg, rad, sides) => {
+      const base = v.length / 9;
+      for (let i = 0; i <= seg; i++) {
+        const s = i / seg;
+        const p = fn(s), p2 = fn(Math.min(s + .01, 1)), p0 = fn(Math.max(s - .01, 0));
+        let tx = p2[0] - p0[0], ty = p2[1] - p0[1], tz = p2[2] - p0[2];
+        const tl = Math.hypot(tx, ty, tz); tx /= tl; ty /= tl; tz /= tl;
+        // A frame around the rope: one axis stays roughly up.
+        let nx = -tz, nz = tx, ny = 0;
+        const nl = Math.hypot(nx, nz) || 1; nx /= nl; nz /= nl;
+        const bx = ty * nz - tz * ny, by = tz * nx - tx * nz, bz = tx * ny - ty * nx;
+        for (let j = 0; j <= sides; j++) {
+          const q = j / sides * TAU, cq = Math.cos(q), sq = Math.sin(q);
+          const ox = nx * cq + bx * sq, oy = ny * cq + by * sq, oz = nz * cq + bz * sq;
+          v.push(p[0] + ox * rad, p[1] + oy * rad, p[2] + oz * rad, ox, oy, oz, Math.atan2(p[2], p[0]), s, 1);
+        }
+      }
+      for (let i = 0; i < seg; i++) for (let j = 0; j < sides; j++) {
+        const a = base + i * (sides + 1) + j, b = a + 1, c = a + sides + 1, d = c + 1;
+        idx.push(a, c, b, b, c, d);
+      }
+    };
+    for (let k = 0; k < 4; k++) {
+      const a0 = k / 4 * TAU, a1 = (k + 1) / 4 * TAU;
+      tube(s => {
+        const a = a0 + (a1 - a0) * s, bow = Math.sin(Math.PI * s);
+        const rad = R + r * .95 + .004 + bow * .021;
+        return [rad * Math.cos(a), r * .10 - bow * .012, rad * Math.sin(a)];
+      }, 56, .0056, 8);
+    }
+    return { v: new Float32Array(v), idx: new Uint32Array(idx) };
+  }
+
+  /* ---------- scene ---------- */
+
+  let P = {}, emptyVao, gridVao, gridCount, ringVao, ringCount;
+  let simTex, surf, caustic, floorTex;
+
+  function build() {
+    emptyVao = gl.createVertexArray();
+    gl.bindVertexArray(emptyVao);
+    gl.disable(gl.CULL_FACE);
+
+    P.tiles = program(FULL_VERT, TILES);
+    P.surface = program(FULL_VERT, SURFACE);
+    P.caustic = program(CAUSTIC_VERT, CAUSTIC_FRAG);
+    P.water = program(FULL_VERT, WATER);
+    P.ring = program(RING_VERT, RING_FRAG);
+
+    simTex = texture(gl.CLAMP_TO_EDGE, gl.LINEAR, gl.LINEAR);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, N, N, 0, gl.RED, gl.FLOAT, null);
+
+    surf = target(1024, 1024, gl.RGBA16F, gl.HALF_FLOAT, gl.LINEAR);
+    caustic = target(2048, 2048, gl.RGBA16F, gl.HALF_FLOAT, gl.LINEAR);
+
+    floorTex = texture(gl.CLAMP_TO_EDGE, gl.LINEAR_MIPMAP_LINEAR, gl.LINEAR);
+    const SIZE = Math.min(3072, gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, SIZE, SIZE, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, floorTex, 0);
+    gl.viewport(0, 0, SIZE, SIZE);
+    gl.useProgram(P.tiles.p);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fbo);
+    gl.bindTexture(gl.TEXTURE_2D, floorTex);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    const aniso = gl.getExtension('EXT_texture_filter_anisotropic');
+    if (aniso) gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT, 8);
+
+    const g = grid(320);
+    gridVao = gl.createVertexArray();
+    gl.bindVertexArray(gridVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, g.v, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, g.idx, gl.STATIC_DRAW);
+    gridCount = g.idx.length;
+
+    const m = ringMesh();
+    ringVao = gl.createVertexArray();
+    gl.bindVertexArray(ringVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, m.v, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 36, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 36, 12);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 36, 24);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, m.idx, gl.STATIC_DRAW);
+    ringCount = m.idx.length;
+
+    gl.bindVertexArray(emptyVao);
+  }
+
+  // Columns are the ring's own x, y (its up axis), and z axes in the world.
+  function ringRotation() {
+    let nx = -ring.gx, ny = 1, nz = -ring.gz;
+    const nl = Math.hypot(nx, ny, nz); nx /= nl; ny /= nl; nz /= nl;
+    const cy = Math.cos(ring.yaw), sy = Math.sin(ring.yaw);
+    let xx = cy, xy = 0, xz = sy;
+    const dot = xx * nx + xy * ny + xz * nz;
+    xx -= dot * nx; xy -= dot * ny; xz -= dot * nz;
+    const xl = Math.hypot(xx, xy, xz); xx /= xl; xy /= xl; xz /= xl;
+    const zx = xy * nz - xz * ny, zy = xz * nx - xx * nz, zz = xx * ny - xy * nx;
+    // z must point along +z at zero tilt and yaw.
+    const s = zz * cy + zx * -sy >= 0 ? 1 : -1;
+    return new Float32Array([xx, xy, xz, nx, ny, nz, zx * s, zy * s, zz * s]);
+  }
+
+  let renderScale = 1;
+  function sizeCanvas() {
+    const w = Math.max(1, innerWidth), h = Math.max(1, innerHeight);
+    const px = Math.min(devicePixelRatio || 1, 2, Math.sqrt(3.4e6 / (w * h))) * renderScale;
+    canvas.width = Math.max(2, Math.round(w * px));
+    canvas.height = Math.max(2, Math.round(h * px));
+  }
+
+  /* ---------- frame ---------- */
+
+  let last = 0, clock = 0, carry = 0, slowFrames = 0, counted = 0, raf = 0;
+
+  function frame(ms) {
+    raf = requestAnimationFrame(frame);
+    const now = ms / 1000;
+    const dt = Math.min(now - last, .05);
+    last = now;
+    clock += dt * (reducedMotion ? .3 : 1);
+
+    carry += dt;
+    let n = 0;
+    while (carry >= STEP && n < 6) {
+      applyCursor(STEP);
+      simTime += STEP;
+      stepRing(STEP);
+      ringIntoWater();
+      stepWater();
+      stepFar();
+      carry -= STEP; n++;
+    }
+    if (n === 6) carry = 0;
+
+    gl.bindVertexArray(emptyVao);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, simTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, N, N, gl.RED, gl.FLOAT, H);
+
+    const t = clock + 30;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, surf.fbo);
+    gl.viewport(0, 0, surf.w, surf.h);
+    gl.useProgram(P.surface.p);
+    bind(0, simTex, P.surface.u.uSim);
+    gl.uniform2f(P.surface.u.uTexel, 1 / N, 1 / N);
+    gl.uniform1f(P.surface.u.uT, t);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // Sunlight, traced three times so each color bends slightly differently.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, caustic.fbo);
+    gl.viewport(0, 0, caustic.w, caustic.h);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(P.caustic.p);
+    gl.bindVertexArray(gridVao);
+    bind(0, surf.tex, P.caustic.u.uSurf);
+    [[1.327, 1, 0, 0], [1.333, 0, 1, 0], [1.340, 0, 0, 1]].forEach(([ior, a, b, c]) => {
+      gl.colorMask(!!a, !!b, !!c, false);
+      gl.uniform1f(P.caustic.u.uIor, ior);
+      gl.drawElements(gl.TRIANGLES, gridCount, gl.UNSIGNED_INT, 0);
+    });
+    gl.colorMask(true, true, true, true);
+    gl.disable(gl.BLEND);
+    gl.bindVertexArray(emptyVao);
+
+    const rot = ringRotation();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clear(gl.DEPTH_BUFFER_BIT);
+
+    const w = P.water;
+    gl.useProgram(w.p);
+    setCamera(w);
+    bind(0, surf.tex, w.u.uSurf);
+    bind(1, floorTex, w.u.uFloor);
+    bind(2, caustic.tex, w.u.uCaustic);
+    gl.uniform3f(w.u.uRingPos, ring.x, ring.y, ring.z);
+    gl.uniformMatrix3fv(w.u.uRingRot, false, rot);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    gl.enable(gl.DEPTH_TEST);
+    const m = P.ring;
+    gl.useProgram(m.p);
+    setCamera(m);
+    bind(0, surf.tex, m.u.uSurf);
+    gl.uniform3f(m.u.uRingPos, ring.x, ring.y, ring.z);
+    gl.uniformMatrix3fv(m.u.uRingRot, false, rot);
+    gl.bindVertexArray(ringVao);
+    gl.drawElements(gl.TRIANGLES, ringCount, gl.UNSIGNED_INT, 0);
+    gl.bindVertexArray(emptyVao);
+
+    // Slower machines trade sharpness for smoothness.
+    counted++;
+    if (dt > .027) slowFrames++;
+    if (counted === 90) {
+      if (slowFrames > 55 && renderScale > .5) {
+        renderScale *= .8;
+        sizeCanvas();
+      }
+      counted = slowFrames = 0;
+    }
+  }
+
+  let pending = 0;
+  addEventListener('resize', () => {
+    clearTimeout(pending);
+    pending = setTimeout(() => { fitView(); sizeCanvas(); }, 120);
+  });
+  document.addEventListener('visibilitychange', () => {
+    last = performance.now() / 1000;
+    counted = slowFrames = 0;
+  });
+  canvas.addEventListener('webglcontextlost', e => {
+    e.preventDefault();
+    cancelAnimationFrame(raf);
+  });
+  canvas.addEventListener('webglcontextrestored', () => {
+    build();
+    last = performance.now() / 1000;
+    raf = requestAnimationFrame(frame);
+  });
+
+  sizeCanvas();
+  build();
+  last = performance.now() / 1000;
+  raf = requestAnimationFrame(frame);
+})();
+</script>
+
+</body>
+</html>
