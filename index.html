@@ -222,7 +222,8 @@
       const yi = ring.y + ring.gx * x + ring.gz * z;
       const s = Math.min(Math.max(h - (yi - r), 0), 2 * r);
       const rel = ring.vy + ring.wx * x + ring.wz * z - wv;
-      const f = (G * circleSegment(s) / REST - 8 * (s / (2 * r)) * rel) / K;
+      // Water drag on the tube is strong: a pressed ring settles after about one bounce instead of bobbing on.
+      const f = (G * circleSegment(s) / REST - 20 * (s / (2 * r)) * rel) / K;
       ay += f; tx += f * x; tz += f * z;
 
       const fo = sampleFar(ring.x + out * ca, ring.z + out * sa), fvo = farV;
@@ -270,8 +271,9 @@
     ring.vz += (az - ring.vz * .42) * dt;
     ring.spin += (turn - ring.spin * .5) * dt;
     ring.vy += ay * dt;
-    ring.wx += ax2 * dt;
-    ring.wz += az2 * dt;
+    // Rocking is damped too, so a held ring stays tipped rather than seesawing out fresh ripples.
+    ring.wx += (ax2 - ring.wx * 5) * dt;
+    ring.wz += (az2 - ring.wz * 5) * dt;
     ring.x += ring.vx * dt;
     ring.z += ring.vz * dt;
     ring.yaw += ring.spin * dt;
@@ -355,8 +357,8 @@
       lastPointer = pointer;
     }
     dwell = Math.max(0, dwell - dt);
-    // A quick press and a slower release, so the ring is free to bounce even if the cursor stays put.
-    ring.press += (target - ring.press) * Math.min(1, dt * (target > ring.press ? 22 : 7));
+    // A firm but not instant press, like a hand, and a slower release, so the ring can bounce back once.
+    ring.press += (target - ring.press) * Math.min(1, dt * (target > ring.press ? 10 : 7));
   }
 
   /* ---------- shaders ---------- */
