@@ -198,7 +198,8 @@
     gx: 0, gz: 0, wx: 0, wz: 0,  // tilt as a slope across the ring, and how fast it changes
     yaw: .35, spin: 0,
     press: 0,                    // how hard the cursor is pushing, 0 to 1
-    pressX: 0, pressZ: 0, pushX: 0, pushZ: 0,
+    pressX: 0, pressZ: 0,         // where the cursor rests on the tube
+    handX: 0, handZ: 0, grip: 0,  // the cursor's velocity, and how firmly it holds the ring
   };
   // Arrives with a small drop so the first moments already show the bounce.
   if (!reducedMotion) { ring.y += .085; ring.gx = .07; ring.gz = -.05; }
@@ -257,9 +258,11 @@
       ay -= A;
       ax2 -= A * ring.pressX / INERTIA;
       az2 -= A * ring.pressZ / INERTIA;
-      ax += ring.pushX * ring.press * 2.6;
-      az += ring.pushZ * ring.press * 2.6;
-      turn += (ring.pressX * ring.pushZ - ring.pressZ * ring.pushX) * ring.press * 7;
+      // The fingertip holds the tube by friction: the ring moves with the cursor, so it stays underneath it.
+      const slipX = ring.handX - ring.vx, slipZ = ring.handZ - ring.vz;
+      ax += slipX * ring.grip * ring.press * 8;
+      az += slipZ * ring.grip * ring.press * 8;
+      turn += (ring.pressX * slipZ - ring.pressZ * slipX) * ring.grip * ring.press * 2.2;
     }
 
     // Free to float anywhere in view. Only the window's edges turn it back, softly.
@@ -313,9 +316,9 @@
 
   /* ---------- cursor ---------- */
 
-  let pointer = null, lastPointer = null, down = false, dwell = 0;
-  let velX = 0, velZ = 0;               // cursor velocity, smoothed so hand jitter reads as still
-  let inContact = false, cooldown = 0, kick = 0;
+  let pointer = null, lastPointer = null, down = false;
+  let velX = 0, velZ = 0;   // cursor velocity, smoothed so hand jitter reads as still
+  let inContact = false;
 
   function moveTo(cx, cy) {
     const b = canvas.getBoundingClientRect();
@@ -327,6 +330,8 @@
   addEventListener('pointerup', () => { down = false; }, { passive: true });
   canvas.addEventListener('pointerleave', () => { pointer = lastPointer = null; velX = velZ = 0; inContact = false; });
 
+  // Touching the ring is one collision: it dips and tilts toward the cursor, sends out one round of
+  // ripples, and then stays tilted for as long as the cursor rests on it. Leaving lets it float back up.
   function applyCursor(dt) {
     let target = 0;
     if (pointer) {
@@ -344,21 +349,16 @@
       const touching = Math.abs(rho - R) < r + (inContact ? .05 : .02);
 
       if (touching) {
-        // Contact point on the tube's centerline.
-        ring.pressX = relX / rho * R; ring.pressZ = relZ / rho * R;
-        const v = Math.min(speed, 2.2);
-        ring.pushX = speed > 1e-4 ? velX / speed * v * .32 : 0;
-        ring.pushZ = speed > 1e-4 ? velZ / speed * v * .32 : 0;
-        // A hover is one tap: the ring dips and tips when the cursor arrives, then is left to settle.
-        // Only a fresh arrival, or a real shove, taps it again.
-        if (cooldown <= 0 && (!inContact || speed > .9)) {
-          kick = Math.min(1, .55 + speed * .4);
-          dwell = .16;
-          cooldown = .7;
-        }
-        if (dwell > 0) target = kick;
-        // Holding the button is a hand that stays on the ring: a steady press, and dragging moves it.
-        if (down) target = 1;
+        // Where the cursor rests on the tube's centerline. Sliding along the tube shifts the tilt smoothly.
+        const px = relX / rho * R, pz = relZ / rho * R;
+        const follow = inContact ? Math.min(1, dt * 10) : 1;
+        ring.pressX += (px - ring.pressX) * follow;
+        ring.pressZ += (pz - ring.pressZ) * follow;
+        const cap = speed > 2.2 ? 2.2 / speed : 1;
+        ring.handX = velX * cap; ring.handZ = velZ * cap;
+        // Resting the cursor is a light hand; holding the button presses harder and drags the ring.
+        ring.grip = down ? 1 : .6;
+        target = down ? 1 : .6;
       } else if (lastPointer && len > 1e-4 && len < .9) {
         // Open water: the cursor draws a soft wake.
         const steps = Math.min(8, Math.ceil(len / .028));
@@ -371,9 +371,7 @@
       inContact = touching;
       lastPointer = pointer;
     }
-    dwell = Math.max(0, dwell - dt);
-    cooldown = Math.max(0, cooldown - dt);
-    // A firm but not instant press, like a hand, and a slower release, so the ring can bounce back once.
+    // A firm but not instant press, like a hand, and a slower release, so the ring rises back once.
     ring.press += (target - ring.press) * Math.min(1, dt * (target > ring.press ? 10 : 7));
   }
 
@@ -392,6 +390,9 @@
   const float RR = ${R.toFixed(3)}, TUBE = ${r.toFixed(3)};
   const vec3 SUN = normalize(vec3(-.40, .92, .34));
   const vec3 SUNCOL = vec3(1.20, 1.12, 1.00);
+  // Light reaching the pool floor comes from nearly overhead, so the ring's shadow and the bright
+  // ripple patterns land under the ring instead of far off to one side.
+  const vec3 FLOOR_SUN = normalize(vec3(-.06, 1., -.13));
   vec2 surfUv(vec2 w){ return w / DOMAIN * .5 + .5; }
   vec2 floorUv(vec2 w){ return w / FLOOR * .5 + .5; }
   vec3 skyColor(vec3 d){
@@ -510,8 +511,8 @@
     vec4 s = textureLod(uSurf, aUv, 0.);
     vec2 w = (aUv * 2. - 1.) * DOMAIN;
     vec3 n = normalize(vec3(-s.g, 1., -s.b));
-    vec3 ref = refract(-SUN, n, 1. / uIor);
-    vec3 flat_ = refract(-SUN, vec3(0,1,0), 1. / uIor);
+    vec3 ref = refract(-FLOOR_SUN, n, 1. / uIor);
+    vec3 flat_ = refract(-FLOOR_SUN, vec3(0,1,0), 1. / uIor);
     vNew = w + ref.xz / -ref.y * (DEPTH + s.r);
     vOld = w + flat_.xz / -flat_.y * DEPTH;
     gl_Position = vec4(vNew / FLOOR, 0., 1.);
@@ -565,7 +566,7 @@
             + texture(uCaustic, cu + vec2(pxl.x, -pxl.y)).rgb + texture(uCaustic, cu - vec2(pxl.x, -pxl.y)).rgb) * .15;
 
     // The ring's shadow on the floor, softened by the depth it falls through.
-    vec3 toSun = refract(-SUN, vec3(0,1,0), 1. / 1.333);
+    vec3 toSun = refract(-FLOOR_SUN, vec3(0,1,0), 1. / 1.333);
     float tp = (DEPTH + uRingPos.y) / -toSun.y;
     vec2 onRing = F - toSun.xz * tp - uRingPos.xz;
     vec3 n = uRingRot[1];
